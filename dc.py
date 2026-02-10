@@ -6,7 +6,7 @@ import arxiv
 from arxiv2text import arxiv_to_text
 
 
-PNOS_PATH = Path("pnos.json")
+PNOS_PATH = Path("papernumbers.json")
 DATASET_PATH = Path("dataset.json")
 
 client = arxiv.Client()

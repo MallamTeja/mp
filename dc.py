@@ -25,7 +25,10 @@ def load_existing_dataset() -> List[Dict]:
     if not DATASET_PATH.exists():
         return []
     with open(DATASET_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)
+        content = f.read().strip()
+        if not content:
+            return []
+        return json.loads(content)
 
 
 def get_existing_ids(dataset: List[Dict]) -> Set[str]:
@@ -55,8 +58,8 @@ def result_to_obj(r: arxiv.Result, full_text: str) -> Dict:
     }
 
 
-def fetch_plain_text_from_pdf(pdf_url: str) -> str:
-    text = arxiv_to_text(pdf_url, output_dir=None)
+def fetch_plain_text_from_pdf(pdf_url: str) -> str: 
+    text = arxiv_to_text(pdf_url)
     return text
 
 

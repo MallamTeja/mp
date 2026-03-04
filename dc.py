@@ -7,15 +7,28 @@ from datetime import datetime, timezone
 
 import arxiv
 from arxiv2text import arxiv_to_text
+from sentence_transformers import SentenceTransformer
+
 
 PNOS1_PATH = Path("papernumbers1.json")
 PNOS2_PATH = Path("papernumbers2.json")
 PNOS3_PATH = Path("papernumbers3.json")
 
 DATASET_PATH = Path("dataset.json")
+EMBED_DATASET_PATH = Path("embeddingdataset.json")
 
 client = arxiv.Client()
 MAX_TEXT_CHARS = 2_000_000
+
+EMB_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+emb_model: Optional[SentenceTransformer] = None
+
+
+def get_emb_model() -> SentenceTransformer:
+    global emb_model
+    if emb_model is None:
+        emb_model = SentenceTransformer(EMB_MODEL_NAME)
+    return emb_model
 
 
 def load_paper_ids_from_file(path: Path, batch_id: int) -> List[Dict]:
@@ -29,17 +42,17 @@ def load_paper_ids_from_file(path: Path, batch_id: int) -> List[Dict]:
 
 
 def load_all_papers_with_batches() -> List[Dict]:
-    papers = []
+    papers: List[Dict] = []
     papers.extend(load_paper_ids_from_file(PNOS1_PATH, batch_id=1))
     papers.extend(load_paper_ids_from_file(PNOS2_PATH, batch_id=2))
     papers.extend(load_paper_ids_from_file(PNOS3_PATH, batch_id=3))
     return papers
 
 
-def load_existing_dataset() -> List[Dict]:
-    if not DATASET_PATH.exists():
+def load_existing_dataset(path: Path) -> List[Dict]:
+    if not path.exists():
         return []
-    with open(DATASET_PATH, "r", encoding="utf-8") as f:
+    with open(path, "r", encoding="utf-8") as f:
         content = f.read().strip()
         if not content:
             return []
@@ -47,7 +60,8 @@ def load_existing_dataset() -> List[Dict]:
 
 
 def get_existing_ids(dataset: List[Dict]) -> Set[str]:
-    return {item.get("arxiv_id") for item in dataset if "arxiv_id" in item}
+    # Used for both dataset.json and embeddingdataset.json
+    return {str(item["arxiv_id"]) for item in dataset if "arxiv_id" in item}
 
 
 def fetch_metadata_for_ids(ids: List[str]):
@@ -97,7 +111,7 @@ def result_to_obj(
     arxiv_id: str,
     r: arxiv.Result,
     full_text: str,
-    paper_number: int,
+    paper_number: Optional[int],
     manual_score: int,
 ) -> Dict:
     if not full_text.strip():
@@ -122,13 +136,33 @@ def result_to_obj(
         "summary_len": summary_len,
         "primary_category": r.primary_category,
         "categories": list(r.categories),
-        "published": r.published.isoformat() if r.published else None,
-        "updated": r.updated.isoformat() if r.updated else None,
         "years_since_published": years_since_published,
         "pdf_url": r.pdf_url,
         "text": full_text,
         "text_len": text_len,
     }
+
+
+def make_embedding_record(raw_obj: Dict, emb_model: SentenceTransformer) -> Dict:
+    """
+    Build a modeling-friendly record:
+    - Keep summary and summary_len.
+    - Remove identifiers and URLs.
+    - Replace 'text' with 'text_embedding'.
+    """
+    text = raw_obj.get("text", "") or ""
+    emb = emb_model.encode(text, convert_to_numpy=True).tolist()
+
+    emb_obj = dict(raw_obj)
+
+    # Remove identifiers / URLs for embeddingdataset
+    for key in ["arxiv_id", "pdf_url"]:
+        emb_obj.pop(key, None)
+
+    emb_obj.pop("text", None)
+    emb_obj["text_embedding"] = emb
+
+    return emb_obj
 
 
 def main():
@@ -140,10 +174,12 @@ def main():
     all_ids = [rec["arxiv_id"] for rec in paper_records]
     paper_number_map = build_paper_number_mapping(all_ids)
 
-    dataset = load_existing_dataset()
+    # RAW DATASET DEDUPE
+    dataset = load_existing_dataset(DATASET_PATH)
     existing_ids = get_existing_ids(dataset)
 
-    to_process = [rec for rec in paper_records if rec["arxiv_id"] not in existing_ids]
+    # edge case: skip any arxiv_id already present in dataset.json
+    to_process: List[Dict] = [rec for rec in paper_records if rec["arxiv_id"] not in existing_ids]
     if not to_process:
         print("No new paper IDs found. Nothing to do.")
         return
@@ -165,6 +201,7 @@ def main():
         print("No results returned from arXiv for the new IDs.")
         return
 
+    # Map short arxiv_id -> result
     result_map: Dict[str, arxiv.Result] = {}
     for r in results:
         rid = r.entry_id.split("/")[-1]
@@ -186,7 +223,6 @@ def main():
 
         print(f"[{i+1}/{len(to_process)}] {arxiv_id} - {r.title}")
 
-        batch_id = batch_map[arxiv_id]
         manual_score = score_map[arxiv_id]
         paper_number = paper_number_map.get(arxiv_id, None)
 
@@ -202,15 +238,39 @@ def main():
         time.sleep(0.2)
 
     if not new_entries:
-        print("No new entries to add.")
+        print("No new entries to add after metadata/text fetch.")
         return
 
+    # Append to raw dataset and save
     dataset.extend(new_entries)
-
     with open(DATASET_PATH, "w", encoding="utf-8") as f:
         json.dump(dataset, f, ensure_ascii=False, indent=2)
-
     print(f"Appended {len(new_entries)} new papers. Total in dataset: {len(dataset)}")
+
+    # EMBEDDING DATASET DEDUPE (independent)
+    emb_model = get_emb_model()
+    emb_dataset_existing = load_existing_dataset(EMBED_DATASET_PATH)
+    emb_existing_ids = get_existing_ids(emb_dataset_existing)
+
+    emb_new_entries: List[Dict] = []
+    for obj in new_entries:
+        arxiv_id = obj["arxiv_id"]
+        if arxiv_id in emb_existing_ids:
+            # Already have an embedding record, skip
+            continue
+        emb_obj = make_embedding_record(obj, emb_model)
+        emb_new_entries.append(emb_obj)
+
+    if not emb_new_entries:
+        print("No new embedding records to add.")
+    else:
+        emb_dataset_existing.extend(emb_new_entries)
+        with open(EMBED_DATASET_PATH, "w", encoding="utf-8") as f:
+            json.dump(emb_dataset_existing, f, ensure_ascii=False, indent=2)
+        print(
+            f"Appended {len(emb_new_entries)} new embedding records. "
+            f"Total in embedding dataset: {len(emb_dataset_existing)}"
+        )
 
 
 if __name__ == "__main__":

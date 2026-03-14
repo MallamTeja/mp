@@ -29,8 +29,8 @@ def load_embedding_dataset(path: Path) -> List[Dict[str, Any]]:
 
 def to_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
     df = pd.DataFrame(records)
-    if "manual_score" not in df.columns:
-        raise ValueError("manual_score not found in embeddingdataset.json")
+    if "llm_score" not in df.columns:
+        raise ValueError("llm_score not found in embeddingdataset.json")
     if "text_embedding" not in df.columns:
         raise ValueError("text_embedding not found in embeddingdataset.json")
     emb_array = np.vstack(df["text_embedding"].values)
@@ -46,9 +46,10 @@ def to_dataframe(records: List[Dict[str, Any]]) -> pd.DataFrame:
 
 
 def build_feature_matrix(df: pd.DataFrame):
-    y = df["manual_score"].astype(float).values
+    y = df["llm_score"].astype(float).values
     drop_cols = [
-        "manual_score",
+        "llm_score",
+        "llm_score_breakdown",  # dict field — not a model feature
         "title",
         "summary",
         "categories",

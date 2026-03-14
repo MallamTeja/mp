@@ -1,36 +1,27 @@
 import json
 import time
-import random
+import sys
 from pathlib import Path
 from typing import List, Dict, Set, Optional
 from datetime import datetime, timezone
 
 import arxiv
 from arxiv2text import arxiv_to_text
-from sentence_transformers import SentenceTransformer
 
 
+# ── Paths ────────────────────────────────────────────────────────────────────
 PNOS1_PATH = Path("papernumbers1.json")
 PNOS2_PATH = Path("papernumbers2.json")
-PNOS3_PATH = Path("papernumbers3.json")
 
 DATASET_PATH = Path("dataset.json")
-EMBED_DATASET_PATH = Path("embeddingdataset.json")
 
+
+# ── arXiv client ─────────────────────────────────────────────────────────────
 client = arxiv.Client()
 MAX_TEXT_CHARS = 2_000_000
 
-EMB_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-emb_model: Optional[SentenceTransformer] = None
 
-
-def get_emb_model() -> SentenceTransformer:
-    global emb_model
-    if emb_model is None:
-        emb_model = SentenceTransformer(EMB_MODEL_NAME)
-    return emb_model
-
-
+# ── Paper ID loading ─────────────────────────────────────────────────────────
 def load_paper_ids_from_file(path: Path, batch_id: int) -> List[Dict]:
     if not path.exists():
         print(f"[WARN] {path} not found, skipping")
@@ -45,10 +36,11 @@ def load_all_papers_with_batches() -> List[Dict]:
     papers: List[Dict] = []
     papers.extend(load_paper_ids_from_file(PNOS1_PATH, batch_id=1))
     papers.extend(load_paper_ids_from_file(PNOS2_PATH, batch_id=2))
-    papers.extend(load_paper_ids_from_file(PNOS3_PATH, batch_id=3))
+    # No Tier 3 file for now
     return papers
 
 
+# ── Dataset helpers ──────────────────────────────────────────────────────────
 def load_existing_dataset(path: Path) -> List[Dict]:
     if not path.exists():
         return []
@@ -60,10 +52,10 @@ def load_existing_dataset(path: Path) -> List[Dict]:
 
 
 def get_existing_ids(dataset: List[Dict]) -> Set[str]:
-    # Used for both dataset.json and embeddingdataset.json
     return {str(item["arxiv_id"]) for item in dataset if "arxiv_id" in item}
 
 
+# ── arXiv fetching ───────────────────────────────────────────────────────────
 def fetch_metadata_for_ids(ids: List[str]):
     if not ids:
         return []
@@ -85,6 +77,7 @@ def fetch_plain_text_from_pdf(pdf_url: str) -> str:
         return ""
 
 
+# ── Feature helpers ───────────────────────────────────────────────────────────
 def compute_years_since_published(published_dt: Optional[datetime]) -> float:
     if not published_dt:
         return 0.0
@@ -93,32 +86,22 @@ def compute_years_since_published(published_dt: Optional[datetime]) -> float:
     return max(delta_years, 0.0)
 
 
-def assign_random_score_for_batch(batch_id: int) -> int:
-    if batch_id == 1:
-        return random.randint(75, 100)
-    elif batch_id == 2:
-        return random.randint(45, 80)
-    else:
-        return random.randint(1, 45)
-
-
 def build_paper_number_mapping(all_ids: List[str]) -> Dict[str, int]:
     sorted_ids = sorted(set(all_ids))
     return {pid: idx + 1 for idx, pid in enumerate(sorted_ids)}
 
 
+# ── Record builder ───────────────────────────────────────────────────────────
 def result_to_obj(
     arxiv_id: str,
     r: arxiv.Result,
     full_text: str,
     paper_number: Optional[int],
-    manual_score: int,
 ) -> Dict:
     if not full_text.strip():
         full_text = r.summary or ""
 
     author_count = len(r.authors) if r.authors else 0
-
     published_dt = r.published if isinstance(r.published, datetime) else None
     years_since_published = compute_years_since_published(published_dt)
 
@@ -129,7 +112,11 @@ def result_to_obj(
     return {
         "arxiv_id": arxiv_id,
         "paper_number": paper_number,
-        "manual_score": manual_score,
+        # scores all start at 0 and will be filled by distillation.py
+        "manual_score": 0,
+        "novelty_score": 0,
+        "rigor_score": 0,
+        "impact_score": 0,
         "title": r.title,
         "author_count": author_count,
         "summary": summary,
@@ -137,85 +124,42 @@ def result_to_obj(
         "primary_category": r.primary_category,
         "categories": list(r.categories),
         "years_since_published": years_since_published,
-        "pdf_url": r.pdf_url,
         "text": full_text,
         "text_len": text_len,
     }
 
 
-def make_embedding_record(raw_obj: Dict, emb_model: SentenceTransformer) -> Dict:
-    """
-    Build a modeling-friendly record:
-    - Keep summary and summary_len.
-    - Remove identifiers and URLs.
-    - Replace 'text' with 'text_embedding'.
-    """
-    text = raw_obj.get("text", "") or ""
-    emb = emb_model.encode(text, convert_to_numpy=True).tolist()
-
-    emb_obj = dict(raw_obj)
-
-    # Remove identifiers / URLs for embeddingdataset
-    for key in ["arxiv_id", "pdf_url"]:
-        emb_obj.pop(key, None)
-
-    emb_obj.pop("text", None)
-    emb_obj["text_embedding"] = emb
-
-    return emb_obj
-
-
-def flush_buffers(
-    raw_buffer: List[Dict],
-    emb_buffer: List[Dict],
-    dataset_path: Path,
-    embed_path: Path,
-):
-    if not raw_buffer and not emb_buffer:
+# ── Flush to disk ─────────────────────────────────────────────────────────────
+def flush_buffer(raw_buffer: List[Dict], dataset_path: Path) -> None:
+    if not raw_buffer:
         return
 
-    # Load existing datasets
     dataset = load_existing_dataset(dataset_path)
-    emb_dataset = load_existing_dataset(embed_path)
+    dataset.extend(raw_buffer)
 
-    # Append and save raw
-    if raw_buffer:
-        dataset.extend(raw_buffer)
-        with open(dataset_path, "w", encoding="utf-8") as f:
-            json.dump(dataset, f, ensure_ascii=False, indent=2)
-        print(
-            f"[FLUSH] Saved {len(raw_buffer)} raw records. "
-            f"Total raw: {len(dataset)}"
-        )
+    with open(dataset_path, "w", encoding="utf-8") as f:
+        json.dump(dataset, f, ensure_ascii=False, indent=2)
 
-    # Append and save embeddings
-    if emb_buffer:
-        emb_dataset.extend(emb_buffer)
-        with open(embed_path, "w", encoding="utf-8") as f:
-            json.dump(emb_dataset, f, ensure_ascii=False, indent=2)
-        print(
-            f"[FLUSH] Saved {len(emb_buffer)} embedding records. "
-            f"Total embeddings: {len(emb_dataset)}"
-        )
-
+    print(
+        f"[FLUSH] Saved {len(raw_buffer)} raw records. "
+        f"Total raw: {len(dataset)}"
+    )
     raw_buffer.clear()
-    emb_buffer.clear()
 
 
-def main():
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main() -> None:
     paper_records = load_all_papers_with_batches()
     if not paper_records:
-        print("No paper IDs found in any papernumbers*.json file.")
+        print("No paper IDs found in papernumbers1.json or papernumbers2.json.")
         return
 
     all_ids = [rec["arxiv_id"] for rec in paper_records]
     paper_number_map = build_paper_number_mapping(all_ids)
 
-    # RAW DATASET DEDUPE
     dataset_existing = load_existing_dataset(DATASET_PATH)
     existing_ids = get_existing_ids(dataset_existing)
 
-    # edge case: skip any arxiv_id already present in dataset.json
     to_process: List[Dict] = [
         rec for rec in paper_records if rec["arxiv_id"] not in existing_ids
     ]
@@ -223,13 +167,12 @@ def main():
         print("No new paper IDs found. Nothing to do.")
         return
 
-    import sys
     limit = len(to_process)
     if len(sys.argv) > 1:
         try:
             limit = int(sys.argv[1])
         except ValueError:
-            print(f"Invalid limit argument: {sys.argv[1]}. Using default limit {limit}.")
+            print(f"[WARN] Invalid limit argument: {sys.argv[1]}, using {limit}")
 
     to_process = to_process[:limit]
     ids_only = [rec["arxiv_id"] for rec in to_process]
@@ -240,59 +183,46 @@ def main():
         print("No results returned from arXiv for the new IDs.")
         return
 
-    # Map short arxiv_id -> result
-    result_map: Dict[str, arxiv.Result] = {}
-    for r in results:
-        rid = r.entry_id.split("/")[-1]
-        result_map[rid] = r
-
-    batch_map = {rec["arxiv_id"]: rec["batch"] for rec in to_process}
-    score_map = {
-        rec["arxiv_id"]: assign_random_score_for_batch(rec["batch"])
-        for rec in to_process
+    result_map: Dict[str, arxiv.Result] = {
+        r.entry_id.split("/")[-1]: r for r in results
     }
 
-    emb_model = get_emb_model()
-
     raw_buffer: List[Dict] = []
-    emb_buffer: List[Dict] = []
     FLUSH_EVERY = 10
 
-    for i, rec in enumerate(to_process):
-        arxiv_id = rec["arxiv_id"]
-        r = result_map.get(arxiv_id)
-        if r is None:
-            print(f"[WARN] No arxiv result for {arxiv_id}, skipping")
-            continue
+    try:
+        for i, rec in enumerate(to_process):
+            arxiv_id = rec["arxiv_id"]
+            r = result_map.get(arxiv_id)
+            if r is None:
+                print(f"[WARN] No arxiv result for {arxiv_id}, skipping")
+                continue
 
-        print(f"[{i+1}/{len(to_process)}] {arxiv_id} - {r.title}")
+            print(f"[{i+1}/{len(to_process)}] {arxiv_id} - {r.title}")
 
-        manual_score = score_map[arxiv_id]
-        paper_number = paper_number_map.get(arxiv_id, None)
+            paper_number = paper_number_map.get(arxiv_id)
+            full_text = fetch_plain_text_from_pdf(r.pdf_url)
 
-        full_text = fetch_plain_text_from_pdf(r.pdf_url)
-        obj = result_to_obj(
-            arxiv_id=arxiv_id,
-            r=r,
-            full_text=full_text,
-            paper_number=paper_number,
-            manual_score=manual_score,
-        )
-        raw_buffer.append(obj)
+            obj = result_to_obj(
+                arxiv_id=arxiv_id,
+                r=r,
+                full_text=full_text,
+                paper_number=paper_number,
+            )
+            raw_buffer.append(obj)
 
-        emb_obj = make_embedding_record(obj, emb_model)
-        emb_buffer.append(emb_obj)
+            time.sleep(0.2)
 
-        time.sleep(0.2)
+            if len(raw_buffer) >= FLUSH_EVERY:
+                flush_buffer(raw_buffer, DATASET_PATH)
 
-        # Flush every 10 records
-        if len(raw_buffer) >= FLUSH_EVERY:
-            flush_buffers(raw_buffer, emb_buffer, DATASET_PATH, EMBED_DATASET_PATH)
-
-    # Final flush for remaining < 10
-    flush_buffers(raw_buffer, emb_buffer, DATASET_PATH, EMBED_DATASET_PATH)
-
-    print("Done.")
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrupted by user (Ctrl+C). Flushing completed records before exit...")
+    except Exception as e:
+        print(f"\n[ERROR] Unexpected error: {e}. Flushing completed records before exit...")
+    finally:
+        flush_buffer(raw_buffer, DATASET_PATH)
+        print("Done (graceful shutdown).")
 
 
 if __name__ == "__main__":

@@ -7,4 +7,5 @@ lightgbm
 numpy
 sentence-transformers
 joblib
-
+google-generativeai
+python-dotenv

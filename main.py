@@ -160,6 +160,9 @@ def extract_summary(text: str, provided_summary: Optional[str]) -> str:
             pos = snippet.lower().find(sentinel)
             if pos != -1:
                 snippet = snippet[:pos]
+        
+        if len(snippet) > 500:
+            snippet = snippet[:500]
         return snippet.strip()
 
     # Fallback: first 500 chars
@@ -175,7 +178,7 @@ def read_uploaded_file(upload: UploadFile) -> str:
     filename = (upload.filename or "").lower()
     raw_bytes = upload.file.read()
 
-    if filename.endswith(".pdf"):
+    if filename and filename.endswith(".pdf"):
         return _extract_pdf_text(raw_bytes)
 
     # Assume plain text / markdown

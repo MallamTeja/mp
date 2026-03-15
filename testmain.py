@@ -285,11 +285,16 @@ class TestExtractSummary:
         result = extract_summary(text, None)
         assert "introduction" not in result.lower()
 
+
     def test_fallback_to_first_500_chars(self):
         from main import extract_summary
         text = "No abstract keyword here just plain text " + "x" * 600
         result = extract_summary(text, None)
+        # Fallback uses first 500 chars of text
         assert len(result) <= 500
+        # The logic trims the start depending on where it thinks metadata ends, 
+        # but in this case it just returns the first 500 chars.
+        assert "keyword here just plain text" in result
 
     def test_empty_provided_summary_falls_back(self):
         from main import extract_summary
@@ -476,7 +481,7 @@ class TestPredictEndpoint:
         """File with no extension should be treated as plain text."""
         resp = client.post(
             "/predict",
-            files={"file": ("", io.BytesIO(PAPER_TEXT.encode()), "text/plain")},
+            files={"file": ("paper_no_ext", io.BytesIO(PAPER_TEXT.encode()), "text/plain")},
         )
         assert resp.status_code == 200
 

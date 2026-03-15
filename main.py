@@ -269,11 +269,11 @@ def build_inference_features(
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 app = FastAPI(
-    title="Paper Quality Scorer",
+    title="Research Papers Authenticity Score Predictor",
     description=(
         "Upload an AI/ML research paper (PDF or plain text) and get a predicted "
-        "quality score (0–100) based on novelty, rigor, and impact — powered by "
-        "a LightGBM model trained on LLM-distilled scores.\n\n"
+        "quality score (0–100) based on authencity, novelty, rigor, and impact — powered by "
+        "a LightGBM model trained on hundreds of papers.\n\n"
         "**Workflow**: `POST /predict` → JSON with `score`, `confidence_band`, and extracted metadata."
     ),
     version="1.0.0",

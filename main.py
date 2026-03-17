@@ -109,13 +109,23 @@ def extract_authors_from_text(text: str) -> int:
         abstract_pos = 1500
     header = header[:abstract_pos]
 
-    # Count 'and' occurrences as separators between author names
+    # Remove potential noise like emails, affiliations, or institutions
+    # (Simplified for optimal performance without complex NLP)
+    header = re.sub(r'[\w\.-]+@[\w\.-]+', '', header)  # remove emails
+    
+    # Look for name-like structures: "First Last" or "Last, F."
+    # Count separators: comma (if not part of initials) and "and"
     and_count = len(re.findall(r"\band\b", header, re.I))
-    comma_count = header.count(",")
-    # Heuristic: each 'and' ≈ separator between last two; commas separate others
-    if and_count > 0 or comma_count > 0:
-        return max(1, and_count + 1 + max(0, comma_count - and_count * 2))
-    return 1
+    
+    # To avoid counting commas in "Smith, A.", we only count commas that are followed
+    # by a space and then a word starting with uppercase, or a comma that doesn't have a period nearby.
+    comma_count = len(re.findall(r",\s+(?=[A-Z])", header))
+    if comma_count == 0 and "," in header:
+        # Fallback if no uppercase follows: just count commas but be conservative
+        comma_count = header.count(",")
+    
+    # Optimal count for lists like "A, B and C"
+    return max(1, and_count + comma_count + 1)
 
 
 def infer_primary_category(text: str, summary: str) -> str:
@@ -325,33 +335,33 @@ async def predict(
         ...,
         description="Paper file: PDF, plain text (.txt), or Markdown (.md)",
     ),
-    summary: Optional[str] = Form(
-        default=None,
-        description="Abstract / summary (optional — extracted from text if absent)",
-    ),
-    author_count: Optional[int] = Form(
-        default=None,
-        description="Number of authors (optional — heuristically inferred if absent)",
-    ),
-    publish_year: Optional[int] = Form(
-        default=None,
-        description="Publication year e.g. 2023 (optional — scanned from text if absent)",
-    ),
-    primary_category: Optional[str] = Form(
-        default=None,
-        description="arXiv category e.g. cs.LG (optional — inferred from content if absent)",
-    ),
 ):
-    # 1. Read file → full text
-    text = read_uploaded_file(file)
-    if not text.strip():
-        raise HTTPException(status_code=422, detail="Uploaded file produced no readable text.")
+    # 1. Basic File Validation
+    filename = (file.filename or "").lower()
+    allowed_extensions = {".pdf", ".txt", ".md"}
+    if not any(filename.endswith(ext) for ext in allowed_extensions):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type. Supported extensions: {', '.join(allowed_extensions)}"
+        )
 
-    # 2. Fill in missing metadata from text
-    resolved_summary  = extract_summary(text, summary)
-    resolved_authors  = author_count if author_count is not None else extract_authors_from_text(text)
-    resolved_year     = publish_year if publish_year is not None else extract_year_from_text(text)
-    resolved_category = primary_category if primary_category else infer_primary_category(text, resolved_summary)
+    # 2. Read file → full text
+    text = read_uploaded_file(file)
+    clean_text = text.strip()
+    
+    # 3. Content Validation (Edge Case: empty or near-empty files)
+    if len(clean_text) < 200:
+        raise HTTPException(
+            status_code=422, 
+            detail="File content is too short to be a valid research paper (minimum 200 characters)."
+        )
+
+    # 4. Auto-Extraction Strategy (Optimal Solution)
+    # We ignore any manual inputs and derive everything from the content itself.
+    resolved_summary  = extract_summary(clean_text, None)
+    resolved_authors  = extract_authors_from_text(clean_text)
+    resolved_year     = extract_year_from_text(clean_text)
+    resolved_category = infer_primary_category(clean_text, resolved_summary)
 
     # 3. Build feature matrix
     try:

@@ -413,64 +413,32 @@ class TestPredictEndpoint:
         resp = client.post("/predict", files=_txt_file(PAPER_TEXT))
         assert resp.json()["extracted"]["text_len"] > 0
 
-    def test_explicit_author_count_used(self, client):
-        resp = client.post(
-            "/predict",
-            files=_txt_file(PAPER_TEXT),
-            data={"author_count": "7"},
-        )
+    def test_auto_extraction_accuracy(self, client):
+        """Verify that author and year are correctly extracted from PAPER_TEXT."""
+        resp = client.post("/predict", files=_txt_file(PAPER_TEXT))
         assert resp.status_code == 200
-        assert resp.json()["extracted"]["author_count"] == 7
+        extracted = resp.json()["extracted"]
+        assert extracted["author_count"] == 3
+        assert extracted["publish_year"] == 2017
 
-    def test_explicit_publish_year_used(self, client):
+    def test_invalid_file_extension(self, client):
+        """Unsupported extensions (e.g. .jpg) should return 400."""
         resp = client.post(
             "/predict",
-            files=_txt_file(PAPER_TEXT),
-            data={"publish_year": "2019"},
+            files={"file": ("photo.jpg", io.BytesIO(b"dummy data " * 50), "image/jpeg")}
         )
-        assert resp.status_code == 200
-        now_year = datetime.now(timezone.utc).year
-        expected_ysp = float(now_year - 2019)
-        assert resp.json()["extracted"]["years_since_published"] == expected_ysp
+        assert resp.status_code == 400
+        assert "Invalid file type" in resp.json()["detail"]
 
-    def test_explicit_primary_category_used(self, client):
-        resp = client.post(
-            "/predict",
-            files=_txt_file(PAPER_TEXT),
-            data={"primary_category": "cs.RO"},
-        )
-        assert resp.status_code == 200
-        assert resp.json()["extracted"]["primary_category"] == "cs.RO"
-
-    def test_explicit_summary_used(self, client):
-        custom_summary = "A custom abstract about robots and locomotion."
-        resp = client.post(
-            "/predict",
-            files=_txt_file(PAPER_TEXT),
-            data={"summary": custom_summary},
-        )
-        assert resp.status_code == 200
-        preview = resp.json()["extracted"]["summary_preview"]
-        assert "custom abstract" in preview
-
-    def test_all_optional_fields_provided(self, client):
-        resp = client.post(
-            "/predict",
-            files=_txt_file(PAPER_TEXT),
-            data={
-                "summary":          "Explicit abstract.",
-                "author_count":     "3",
-                "publish_year":     "2021",
-                "primary_category": "stat.ML",
-            },
-        )
-        assert resp.status_code == 200
-        e = resp.json()["extracted"]
-        assert e["author_count"]       == 3
-        assert e["primary_category"]   == "stat.ML"
+    def test_content_too_short(self, client):
+        """Files with < 200 characters should return 422."""
+        short_text = "This is a very short text."
+        resp = client.post("/predict", files=_txt_file(short_text))
+        assert resp.status_code == 422
+        assert "too short" in resp.json()["detail"]
 
     def test_markdown_file_accepted(self, client):
-        md_content = "# Title\n\n**Authors**: A, B\n\nAbstract\nSome abstract.\n\n## Introduction\nBody."
+        md_content = "# Title\n\n**Authors**: Alice Smith, Bob Jones\n\nAbstract\n" + ("This is a long abstract for testing. " * 10) + "\n\n## Introduction\n" + ("Body text " * 50)
         resp = client.post(
             "/predict",
             files={"file": ("paper.md", io.BytesIO(md_content.encode()), "text/markdown")},
@@ -478,10 +446,11 @@ class TestPredictEndpoint:
         assert resp.status_code == 200
 
     def test_no_filename_defaults_to_text(self, client):
-        """File with no extension should be treated as plain text."""
+        """File with no extension should be treated as plain text if it has a valid mimetype or we allow it."""
+        # Update: We now enforce extensions. So we test that a valid extension works.
         resp = client.post(
             "/predict",
-            files={"file": ("paper_no_ext", io.BytesIO(PAPER_TEXT.encode()), "text/plain")},
+            files={"file": ("paper.txt", io.BytesIO(PAPER_TEXT.encode()), "text/plain")},
         )
         assert resp.status_code == 200
 
@@ -510,18 +479,18 @@ class TestPredictEdgeCases:
 
     def test_no_file_returns_422(self, client):
         """Missing file field entirely."""
-        resp = client.post("/predict", data={"author_count": "2"})
+        resp = client.post("/predict")
         assert resp.status_code == 422
 
     def test_paper_without_abstract_keyword(self, client):
         """Paper text without 'Abstract' keyword still succeeds — fallback used."""
-        text = "Some Title\nAuthors: X, Y\n\nThis is body text without an abstract keyword.\n2022"
+        text = "Some Title\nAuthors: X, Y\n\n" + ("This is body text without an abstract keyword. " * 10) + "\n2022\n" + ("More filler text " * 20)
         resp = client.post("/predict", files=_txt_file(text))
         assert resp.status_code == 200
 
     def test_paper_without_year(self, client):
-        """No year in text and no publish_year form field — years_since_published=0."""
-        text = "Title\nAuthor A\nAbstract\nSome content without any date."
+        """No year in text — years_since_published should be 0.0."""
+        text = "Title\nAuthor A\nAbstract\n" + ("Some content without any date information. " * 10) + "\n" + ("More filler text " * 20)
         resp = client.post("/predict", files=_txt_file(text))
         assert resp.status_code == 200
         assert resp.json()["extracted"]["years_since_published"] == 0.0
@@ -534,7 +503,7 @@ class TestPredictEdgeCases:
 
     def test_unicode_text(self, client):
         """Papers with non-ASCII characters (e.g. accented author names)."""
-        text = "Müller, Ångström and 田中\n\nAbstract\nDeep learning with Transformer. 2021"
+        text = "Müller, Ångström and 田中\n\nAbstract\n" + ("Deep learning with Transformer and large scale unicode support. " * 10) + " 2021"
         resp = client.post("/predict", files=_txt_file(text))
         assert resp.status_code == 200
 
@@ -565,23 +534,17 @@ class TestPredictEdgeCases:
         assert resp.json()["score"] == 0.0
 
     def test_summary_preview_truncated_at_300(self, client):
+        # Create a text with a long abstract section
         long_summary = "A " * 200   # 400 chars
-        resp = client.post(
-            "/predict",
-            files=_txt_file(PAPER_TEXT),
-            data={"summary": long_summary},
-        )
+        text = f"Abstract\n{long_summary}\n\n1 Introduction\n" + ("Body text " * 50)
+        resp = client.post("/predict", files=_txt_file(text))
         preview = resp.json()["extracted"]["summary_preview"]
         assert len(preview) <= 303   # 300 + "..."
         assert preview.endswith("...")
 
     def test_summary_preview_not_truncated_when_short(self, client):
-        short_summary = "Short abstract."
-        resp = client.post(
-            "/predict",
-            files=_txt_file(PAPER_TEXT),
-            data={"summary": short_summary},
-        )
+        short_text = "Abstract\nShort abstract.\n\n1 Introduction\n" + ("Body text " * 50)
+        resp = client.post("/predict", files=_txt_file(short_text))
         preview = resp.json()["extracted"]["summary_preview"]
         assert not preview.endswith("...")
 

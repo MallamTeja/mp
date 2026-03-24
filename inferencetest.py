@@ -2,6 +2,7 @@ import json
 import joblib
 import pandas as pd
 import numpy as np
+import time
 from pathlib import Path
 
 # Paths
@@ -55,19 +56,27 @@ def main():
         return
         
     print(f"\nTesting inference for ArXiv ID: {sample.get('arxiv_id')}")
+    
+    t0 = time.perf_counter()
     X = preprocess_record(sample)
+    t1 = time.perf_counter()
     
     if X is None:
         print("Preprocessing failed.")
         return
         
     prediction = model.predict(X)[0]
+    t2 = time.perf_counter()
     actual = sample.get("manual_score")
     
     print("-" * 30)
     print(f"Actual Score:    {actual}")
     print(f"Predicted Score: {prediction:.2f}")
     print(f"Difference:      {abs(actual - prediction):.2f}")
+    print("-" * 30)
+    print(f"Preprocessing time: {(t1-t0)*1000:.2f} ms")
+    print(f"Model inference:    {(t2-t1)*1000:.2f} ms")
+    print(f"Total local time:   {(t2-t0)*1000:.2f} ms")
     print("-" * 30)
 
 if __name__ == "__main__":

@@ -16,14 +16,31 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-
+import time
 import joblib
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
+
+# Heavy imports moved to top-level for eager loading
+try:
+    from sentence_transformers import SentenceTransformer
+except ImportError:
+    SentenceTransformer = None
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
+    import pdfplumber
+except ImportError:
+    pdfplumber = None
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 MODEL_PATH = Path("lightgbmv1.joblib")
@@ -52,6 +69,7 @@ def get_model() -> lgb.Booster:
                 f"Model file '{MODEL_PATH}' not found. "
                 "Run lbg1.py to train and save the model first."
             )
+        print(f"Loading model from {MODEL_PATH}...")
         _model = joblib.load(MODEL_PATH)
     return _model
 
@@ -59,9 +77,25 @@ def get_model() -> lgb.Booster:
 def get_embedder():
     global _embedder
     if _embedder is None:
-        from sentence_transformers import SentenceTransformer
+        if SentenceTransformer is None:
+            raise RuntimeError("sentence-transformers not installed.")
+        print("Loading SentenceTransformer model 'all-MiniLM-L6-v2'...")
         _embedder = SentenceTransformer("all-MiniLM-L6-v2")
     return _embedder
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Eagerly load model and embedder on startup."""
+    print("--- Startup: Eagerly loading models ---")
+    try:
+        get_model()
+        get_embedder()
+        print("--- Startup: Models loaded successfully ---")
+    except Exception as e:
+        print(f"--- Startup ERROR: Could not load models: {e} ---")
+    yield
+    print("--- Shutdown: Cleaning up ---")
 
 
 # ── Paper parsing helpers ───────────────────────────────────────────────────────
@@ -195,46 +229,40 @@ def read_uploaded_file(upload: UploadFile) -> str:
     for enc in ("utf-8", "latin-1", "utf-16"):
         try:
             return raw_bytes.decode(enc)
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, LookupError):
             continue
     raise HTTPException(status_code=400, detail="Could not decode uploaded file as text.")
 
 
 def _extract_pdf_text(raw_bytes: bytes) -> str:
     """Try PyMuPDF first, fall back to pdfplumber."""
-    try:
-        import fitz  # PyMuPDF
-        doc  = fitz.open(stream=raw_bytes, filetype="pdf")
-        text = "\n".join(page.get_text() for page in doc)
-        doc.close()
-        if text.strip():
-            return text
-    except Exception:
-        pass
+    if fitz:
+        try:
+            doc  = fitz.open(stream=raw_bytes, filetype="pdf")
+            text = "\n".join(page.get_text() for page in doc)
+            doc.close()
+            if text.strip():
+                return text
+        except Exception:
+            pass
 
-    try:
-        import pdfplumber
-        with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
-            text = "\n".join(
-                page.extract_text() or "" for page in pdf.pages
-            )
-        if text.strip():
-            return text
-    except Exception:
-        pass
-
-    try:
-        from arxiv2text import arxiv_to_text  # type: ignore
-        # arxiv2text needs a URL; not usable here directly
-        pass
-    except Exception:
-        pass
+    if pdfplumber:
+        try:
+            import io
+            with pdfplumber.open(io.BytesIO(raw_bytes)) as pdf:
+                text = "\n".join(
+                    page.extract_text() or "" for page in pdf.pages
+                )
+            if text.strip():
+                return text
+        except Exception:
+            pass
 
     raise HTTPException(
         status_code=422,
         detail=(
             "Could not extract text from PDF. "
-            "Install PyMuPDF (`pip install PyMuPDF`) or pdfplumber (`pip install pdfplumber`)."
+            "Ensure PyMuPDF or pdfplumber is installed."
         ),
     )
 
@@ -294,6 +322,7 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 
@@ -337,6 +366,7 @@ async def predict(
     ),
 ):
     # 1. Basic File Validation
+    t0 = time.perf_counter()
     filename = (file.filename or "").lower()
     allowed_extensions = {".pdf", ".txt", ".md"}
     if not any(filename.endswith(ext) for ext in allowed_extensions):
@@ -348,6 +378,7 @@ async def predict(
     # 2. Read file → full text
     text = read_uploaded_file(file)
     clean_text = text.strip()
+    t_file_read = time.perf_counter()
     
     # 3. Content Validation (Edge Case: empty or near-empty files)
     if len(clean_text) < 200:
@@ -362,6 +393,7 @@ async def predict(
     resolved_authors  = extract_authors_from_text(clean_text)
     resolved_year     = extract_year_from_text(clean_text)
     resolved_category = infer_primary_category(clean_text, resolved_summary)
+    t_extraction = time.perf_counter()
 
     # 3. Build feature matrix
     try:
@@ -374,6 +406,7 @@ async def predict(
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Feature extraction failed: {e}")
+    t_features = time.perf_counter()
 
     # 4. Predict
     model = get_model()
@@ -381,6 +414,16 @@ async def predict(
         raw_score = float(model.predict(X, num_iteration=model.best_iteration)[0])
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Model inference failed: {e}")
+    t_predict = time.perf_counter()
+
+    # Log timing
+    print(f"\n--- Inference Timing for {filename} ---")
+    print(f"File Read/PDF Extraction: {(t_file_read - t0):.4f}s")
+    print(f"Metadata Extraction:      {(t_extraction - t_file_read):.4f}s")
+    print(f"Feature Building (Emb):   {(t_features - t_extraction):.4f}s")
+    print(f"Model Prediction:         {(t_predict - t_features):.4f}s")
+    print(f"Total Inference Time:     {(t_predict - t0):.4f}s")
+    print("------------------------------------------\n")
 
     # Clamp to valid range
     score = float(np.clip(raw_score, 0.0, 100.0))

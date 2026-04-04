@@ -2,6 +2,8 @@ services:
   - type: web
     name: paper-scorer
     runtime: python
-    buildCommand: pip install -r req.txt
+    buildCommand: |
+      pip install -r req.txt
+      python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health

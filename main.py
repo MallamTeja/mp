@@ -86,14 +86,15 @@ def get_embedder():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Eagerly load model and embedder on startup."""
-    print("--- Startup: Eagerly loading models ---")
+    """Eagerly load only the fast, local model on startup."""
+    print("--- Startup: Loading LightGBM model ---")
     try:
-        get_model()
-        get_embedder()
-        print("--- Startup: Models loaded successfully ---")
+        get_model()  # Fast, local file
+        print("--- Startup: LightGBM model loaded successfully ---")
     except Exception as e:
-        print(f"--- Startup ERROR: Could not load models: {e} ---")
+        print(f"--- Startup ERROR: Could not load LightGBM model: {e} ---")
+        # In production, you might want to raise here to prevent serving traffic without a model:
+        # raise
     yield
     print("--- Shutdown: Cleaning up ---")
 
